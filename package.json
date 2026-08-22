@@ -17,6 +17,7 @@
   "build": {
     "appId": "com.tstrike.game",
     "productName": "T-STRIKE",
+    "publish": null,
     "directories": {
       "output": "dist"
     },
