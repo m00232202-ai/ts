@@ -1,0 +1,39 @@
+{
+  "name": "t-strike",
+  "version": "1.0.0",
+  "description": "T-STRIKE: P2P MULTIPLAYER REALISM",
+  "main": "main.js",
+  "author": "You",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:portable": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.tstrike.game",
+    "productName": "T-STRIKE",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "game/**/*",
+      "build/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
