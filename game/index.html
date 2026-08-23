@@ -365,6 +365,8 @@
     <script type="module">
         import * as THREE from 'three';
         import { PointerLockControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/PointerLockControls.js';
+        import { FBXLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/FBXLoader.js';
+        import * as SkeletonUtils from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/utils/SkeletonUtils.js';
 
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
@@ -1229,7 +1231,7 @@
                     if (dist < 18) {
                         bot.hp -= Math.floor((1 - dist / 18) * weapons[4].damage);
                         spawnBlood(bot.mesh.position.clone().add(new THREE.Vector3(0, 1.2, 0)), 15);
-                        if (bot.hp <= 0) { scene.remove(bot.mesh); bots.splice(i, 1); }
+                        if (bot.hp <= 0) { killBot(bot); }
                     }
                 }
             } 
@@ -1256,7 +1258,130 @@
             }
         }
         
+        // ==========================================
+        // 3D-МОДЕЛІ ПЕРСОНАЖІВ (FBX / Mixamo)
+        // ==========================================
+        const fbxLoader = new FBXLoader();
+        let characterAssetsReady = false;
+        let baseCharacterModel = null;
+        let clipWalk = null;
+        let clipJump = null;
+        let clipDeath = null;
+
+        // Mixamo-експорт зазвичай у сантиметрах — 0.01 переводить у метри сцени.
+        // Якщо модель здається занадто великою/малою — підправ це число.
+        const CHARACTER_SCALE = 0.01;
+
+        function loadFBX(url) {
+            return new Promise((resolve, reject) => {
+                fbxLoader.load(url, resolve, undefined, reject);
+            });
+        }
+
+        async function loadCharacterAssets() {
+            try {
+                const [stepping, jumping, dying] = await Promise.all([
+                    loadFBX('models/character/Stepping_Backward.fbx'),
+                    loadFBX('models/character/Jumping.fbx'),
+                    loadFBX('models/character/Dying.fbx'),
+                ]);
+
+                baseCharacterModel = stepping; // базова модель = меш + скелет (беремо з будь-якого файлу, вони ідентичні)
+                baseCharacterModel.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+
+                clipWalk = stepping.animations[0] || null;
+                clipJump = jumping.animations[0] || null;
+                clipDeath = dying.animations[0] || null;
+
+                characterAssetsReady = true;
+                console.log('[Models] 3D-моделі персонажів завантажені.');
+            } catch (e) {
+                console.warn('[Models] Не вдалося завантажити 3D-моделі персонажів, лишаються прості фігури.', e);
+                characterAssetsReady = false;
+            }
+        }
+        loadCharacterAssets();
+
+        // Приховує кубічні хітбокси візуально, але лишає їх активними для рейкастингу (влучань).
+        function hideHitboxMeshesVisually(meshes) {
+            meshes.forEach(m => {
+                if (m && m.material) {
+                    m.material = m.material.clone();
+                    m.material.transparent = true;
+                    m.material.opacity = 0;
+                    m.material.depthWrite = false;
+                }
+            });
+        }
+
+        // Додає анімовану 3D-модель персонажа (клон базової) до групи бота/гравця.
+        // hitboxMeshes лишаються в сцені як невидимі колайдери для попадань.
+        function attachCharacterVisual(entity, group, hitboxMeshes) {
+            hideHitboxMeshesVisually(hitboxMeshes);
+
+            if (!characterAssetsReady || !baseCharacterModel) return; // запасний варіант — лишаються тільки кубики
+
+            const visual = SkeletonUtils.clone(baseCharacterModel);
+            visual.scale.setScalar(CHARACTER_SCALE);
+            visual.position.y = 0;
+            visual.traverse(c => {
+                if (c.isMesh) {
+                    c.castShadow = true;
+                    c.receiveShadow = true;
+                    c.raycast = () => {}; // стрільба має влучати саме в невидимі хітбокси, а не в меш моделі
+                }
+            });
+            group.add(visual);
+
+            const mixer = new THREE.AnimationMixer(visual);
+            const walkAction = clipWalk ? mixer.clipAction(clipWalk) : null;
+            const jumpAction = clipJump ? mixer.clipAction(clipJump) : null;
+            const deathAction = clipDeath ? mixer.clipAction(clipDeath) : null;
+
+            if (walkAction) { walkAction.play(); walkAction.paused = true; walkAction.time = 0; }
+            if (jumpAction) { jumpAction.setLoop(THREE.LoopOnce); jumpAction.clampWhenFinished = true; }
+            if (deathAction) { deathAction.setLoop(THREE.LoopOnce); deathAction.clampWhenFinished = true; }
+
+            entity.visual = visual;
+            entity.mixer = mixer;
+            entity.actions = { walk: walkAction, jump: jumpAction, death: deathAction };
+            entity.isMoving = false;
+        }
+
+        // Викликається щокадру для бота/гравця з моделлю: оновлює mixer і перемикає ходьбу/спокій.
+        function updateCharacterAnimation(entity, delta) {
+            if (!entity.mixer) return;
+            entity.mixer.update(delta);
+            if (entity.dying) return;
+            const a = entity.actions;
+            if (a && a.walk) {
+                if (entity.isMoving) {
+                    a.walk.paused = false;
+                    a.walk.timeScale = -1; // клип "крок назад", у зворотному напрямку виглядає як крок вперед
+                } else {
+                    a.walk.paused = true;
+                }
+            }
+        }
+
         const bots = [];
+
+        // Програє анімацію смерті бота і видаляє його з поля бою з невеликою затримкою.
+        function killBot(bot) {
+            if (bot.dying) return;
+            bot.dying = true;
+            if (bot.actions && bot.actions.death) {
+                if (bot.actions.walk) bot.actions.walk.stop();
+                bot.actions.death.reset().play();
+            }
+            const removeDelay = (bot.actions && bot.actions.death) ? 1400 : 0;
+            setTimeout(() => {
+                scene.remove(bot.mesh);
+                const idx = bots.indexOf(bot);
+                if (idx !== -1) bots.splice(idx, 1);
+            }, removeDelay);
+        }
+
         function spawnBot(x, z, overrideId = null) {
             const botId = overrideId || Math.random().toString(36).substring(2, 10);
             const g = new THREE.Group();
@@ -1267,7 +1392,10 @@
             const head = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.38, 0.38), new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.9 })); head.position.y = 1.79;
             g.add(lLeg, rLeg, shirt, head); g.position.set(x, getElevation(x, z), z);
             g.traverse(c => { if(c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
-            scene.add(g); bots.push({ id: botId, mesh: g, hp: 100, lastShot: 0 });
+            scene.add(g);
+            const botEntry = { id: botId, mesh: g, hp: 100, lastShot: 0, dying: false, isMoving: false };
+            attachCharacterVisual(botEntry, g, [lLeg, rLeg, shirt, head]);
+            bots.push(botEntry);
         }
 
         function createRemotePlayerModel(id, name, hp = 100) {
@@ -1321,8 +1449,11 @@
                 weaponMesh: null,
                 currentWeaponId: null,
                 hp: hp,
-                nickname: name
+                nickname: name,
+                isMoving: false
             };
+
+            attachCharacterVisual(remotePlayers[id], group, [lLeg, rLeg, body, head, helmet]);
         }
 
         function removeRemotePlayer(id) {
@@ -2418,7 +2549,7 @@
                         spawnBlood(hitPoint, 15);
                         if (!isMultiplayer || p2pRole === 'host') {
                             bot.hp -= w.damage;
-                            if (bot.hp <= 0) { spawnBlood(bot.mesh.position.clone().add(new THREE.Vector3(0, 1.2, 0)), 35); scene.remove(bot.mesh); bots.splice(bots.indexOf(bot), 1); }
+                            if (bot.hp <= 0) { spawnBlood(bot.mesh.position.clone().add(new THREE.Vector3(0, 1.2, 0)), 35); killBot(bot); }
                         } 
                         else if (p2pRole === 'client') {
                             sendP2PMessage({ type: 'damageBot', id: bot.id, amount: w.damage });
@@ -2520,7 +2651,7 @@
                         spawnBlood(hitPoint, 20);
                         if (!isMultiplayer || p2pRole === 'host') {
                             bot.hp -= w.damage; 
-                            if(bot.hp <= 0) { scene.remove(bot.mesh); bots.splice(bots.indexOf(bot), 1); } 
+                            if(bot.hp <= 0) { killBot(bot); } 
                         } else if (p2pRole === 'client') {
                             sendP2PMessage({ type: 'damageBot', id: bot.id, amount: w.damage });
                         }
@@ -3068,6 +3199,8 @@
                     }
 
                     bots.forEach(bot => {
+                        if (bot.dying) { updateCharacterAnimation(bot, delta); return; }
+
                         bot.mesh.position.y = getElevation(bot.mesh.position.x, bot.mesh.position.z);
                         
                         let targetPos = camera.position;
@@ -3083,9 +3216,11 @@
                             });
                         }
 
+                        bot.isMoving = false;
+
                         if (targetDist < 80) {
                             bot.mesh.lookAt(targetPos.x, bot.mesh.position.y, targetPos.z);
-                            if (targetDist > 15) { bot.mesh.translateZ(5.0 * delta); } 
+                            if (targetDist > 15) { bot.mesh.translateZ(5.0 * delta); bot.isMoving = true; } 
                             else if (performance.now() - bot.lastShot > 1000) {
                                 bot.lastShot = performance.now();
                                 
@@ -3113,16 +3248,35 @@
                                 }
                             }
                         }
+                        updateCharacterAnimation(bot, delta);
                     });
                 } else if (p2pRole === 'client') {
                     bots.forEach(bot => {
+                        if (bot.dying) { updateCharacterAnimation(bot, delta); return; }
+
                         if (bot.targetPos) {
+                            const d = bot.mesh.position.distanceTo(bot.targetPos);
+                            bot.isMoving = d > 0.05;
                             bot.mesh.position.lerp(bot.targetPos, 15 * delta);
+                        } else {
+                            bot.isMoving = false;
                         }
                         bot.mesh.position.y = getElevation(bot.mesh.position.x, bot.mesh.position.z);
+                        updateCharacterAnimation(bot, delta);
                     });
                 }
             }
+
+            Object.values(remotePlayers).forEach(p => {
+                if (p.lastPos) {
+                    p.isMoving = p.group.position.distanceTo(p.lastPos) > 0.001;
+                } else {
+                    p.isMoving = false;
+                }
+                p.lastPos = p.group.position.clone();
+                updateCharacterAnimation(p, delta);
+            });
+
             renderer.render(scene, camera);
         }
         animate();
