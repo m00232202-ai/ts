@@ -1262,15 +1262,19 @@
         // 3D-МОДЕЛІ ПЕРСОНАЖІВ (FBX / Mixamo)
         // ==========================================
         const fbxLoader = new FBXLoader();
+        const textureLoader = new THREE.TextureLoader();
         let characterAssetsReady = false;
         let baseCharacterModel = null;
-        let clipWalk = null;
+        let characterTexture = null;
+        let clipRun = null;
         let clipJump = null;
+        let clipTurn = null;
         let clipDeath = null;
 
         // Mixamo-експорт зазвичай у сантиметрах — 0.01 переводить у метри сцени.
-        // Якщо модель здається занадто великою/малою — підправ це число.
-        const CHARACTER_SCALE = 0.01;
+        // Три числа нарізно, щоб можна було підправити форму (ширше/вужче/вище),
+        // не чіпаючи інші осі. Поки що однакові — підправимо, коли побачу скріншот.
+        const CHARACTER_SCALE = new THREE.Vector3(0.01, 0.01, 0.01);
 
         function loadFBX(url) {
             return new Promise((resolve, reject) => {
@@ -1278,23 +1282,51 @@
             });
         }
 
+        function loadCharacterTexture(url) {
+            return new Promise((resolve) => {
+                textureLoader.load(url, (tex) => {
+                    tex.colorSpace = THREE.SRGBColorSpace;
+                    resolve(tex);
+                }, undefined, () => resolve(null)); // якщо текстура не завантажилась — просто без неї, не валимо все
+            });
+        }
+
         async function loadCharacterAssets() {
             try {
-                const [stepping, jumping, dying] = await Promise.all([
-                    loadFBX('models/character/Stepping_Backward.fbx'),
+                const [runFbx, jumpFbx, turnFbx, dyingFbx, texture] = await Promise.all([
+                    loadFBX('models/character/Fast_Run.fbx'),
                     loadFBX('models/character/Jumping.fbx'),
+                    loadFBX('models/character/Right_Turn.fbx'),
                     loadFBX('models/character/Dying.fbx'),
+                    loadCharacterTexture('textures/character_camo.png'),
                 ]);
 
-                baseCharacterModel = stepping; // базова модель = меш + скелет (беремо з будь-якого файлу, вони ідентичні)
-                baseCharacterModel.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+                baseCharacterModel = runFbx; // базова модель = меш + скелет
+                characterTexture = texture;
 
-                clipWalk = stepping.animations[0] || null;
-                clipJump = jumping.animations[0] || null;
-                clipDeath = dying.animations[0] || null;
+                baseCharacterModel.traverse(c => {
+                    if (c.isMesh) {
+                        c.castShadow = true;
+                        c.receiveShadow = true;
+                        if (characterTexture) {
+                            const applyTex = (mat) => {
+                                mat.map = characterTexture;
+                                mat.color.set(0xffffff); // щоб текстура показувалась без домішки старого кольору
+                                mat.needsUpdate = true;
+                            };
+                            if (Array.isArray(c.material)) c.material.forEach(applyTex);
+                            else if (c.material) applyTex(c.material);
+                        }
+                    }
+                });
+
+                clipRun = runFbx.animations[0] || null;
+                clipJump = jumpFbx.animations[0] || null;
+                clipTurn = turnFbx.animations[0] || null;
+                clipDeath = dyingFbx.animations[0] || null;
 
                 characterAssetsReady = true;
-                console.log('[Models] 3D-моделі персонажів завантажені.');
+                console.log('[Models] 3D-моделі персонажів завантажені (біг, поворот, текстура).');
             } catch (e) {
                 console.warn('[Models] Не вдалося завантажити 3D-моделі персонажів, лишаються прості фігури.', e);
                 characterAssetsReady = false;
@@ -1322,7 +1354,7 @@
             if (!characterAssetsReady || !baseCharacterModel) return; // запасний варіант — лишаються тільки кубики
 
             const visual = SkeletonUtils.clone(baseCharacterModel);
-            visual.scale.setScalar(CHARACTER_SCALE);
+            visual.scale.copy(CHARACTER_SCALE);
             visual.position.y = 0;
             visual.traverse(c => {
                 if (c.isMesh) {
@@ -1334,34 +1366,48 @@
             group.add(visual);
 
             const mixer = new THREE.AnimationMixer(visual);
-            const walkAction = clipWalk ? mixer.clipAction(clipWalk) : null;
+            const runAction = clipRun ? mixer.clipAction(clipRun) : null;
             const jumpAction = clipJump ? mixer.clipAction(clipJump) : null;
+            const turnAction = clipTurn ? mixer.clipAction(clipTurn) : null;
             const deathAction = clipDeath ? mixer.clipAction(clipDeath) : null;
 
-            if (walkAction) { walkAction.play(); walkAction.paused = true; walkAction.time = 0; }
+            if (runAction) { runAction.play(); runAction.paused = true; runAction.time = 0; }
+            if (turnAction) { turnAction.play(); turnAction.paused = true; turnAction.time = 0; }
             if (jumpAction) { jumpAction.setLoop(THREE.LoopOnce); jumpAction.clampWhenFinished = true; }
             if (deathAction) { deathAction.setLoop(THREE.LoopOnce); deathAction.clampWhenFinished = true; }
 
             entity.visual = visual;
             entity.mixer = mixer;
-            entity.actions = { walk: walkAction, jump: jumpAction, death: deathAction };
+            entity.actions = { run: runAction, jump: jumpAction, turn: turnAction, death: deathAction };
             entity.isMoving = false;
+            entity.isTurning = false;
+            entity.lastQuat = null;
         }
 
-        // Викликається щокадру для бота/гравця з моделлю: оновлює mixer і перемикає ходьбу/спокій.
+        // Відстежує зміну орієнтації між кадрами, щоб можна було вмикати анімацію повороту.
+        function trackTurning(entity, group) {
+            if (entity.lastQuat) {
+                entity.isTurning = entity.lastQuat.angleTo(group.quaternion) > 0.03;
+            } else {
+                entity.isTurning = false;
+            }
+            if (!entity.lastQuat) entity.lastQuat = group.quaternion.clone();
+            else entity.lastQuat.copy(group.quaternion);
+        }
+
+        // Викликається щокадру для бота/гравця з моделлю: оновлює mixer і перемикає біг/поворот/спокій.
         function updateCharacterAnimation(entity, delta) {
             if (!entity.mixer) return;
             entity.mixer.update(delta);
             if (entity.dying) return;
             const a = entity.actions;
-            if (a && a.walk) {
-                if (entity.isMoving) {
-                    a.walk.paused = false;
-                    a.walk.timeScale = -1; // клип "крок назад", у зворотному напрямку виглядає як крок вперед
-                } else {
-                    a.walk.paused = true;
-                }
-            }
+            if (!a) return;
+
+            const wantRun = !!entity.isMoving;
+            const wantTurn = !wantRun && !!entity.isTurning;
+
+            if (a.run) a.run.paused = !wantRun;
+            if (a.turn) a.turn.paused = !wantTurn;
         }
 
         const bots = [];
@@ -1371,7 +1417,8 @@
             if (bot.dying) return;
             bot.dying = true;
             if (bot.actions && bot.actions.death) {
-                if (bot.actions.walk) bot.actions.walk.stop();
+                if (bot.actions.run) bot.actions.run.stop();
+                if (bot.actions.turn) bot.actions.turn.stop();
                 bot.actions.death.reset().play();
             }
             const removeDelay = (bot.actions && bot.actions.death) ? 1400 : 0;
@@ -3248,6 +3295,7 @@
                                 }
                             }
                         }
+                        trackTurning(bot, bot.mesh);
                         updateCharacterAnimation(bot, delta);
                     });
                 } else if (p2pRole === 'client') {
@@ -3262,6 +3310,7 @@
                             bot.isMoving = false;
                         }
                         bot.mesh.position.y = getElevation(bot.mesh.position.x, bot.mesh.position.z);
+                        trackTurning(bot, bot.mesh);
                         updateCharacterAnimation(bot, delta);
                     });
                 }
@@ -3274,6 +3323,7 @@
                     p.isMoving = false;
                 }
                 p.lastPos = p.group.position.clone();
+                trackTurning(p, p.group);
                 updateCharacterAnimation(p, delta);
             });
 
